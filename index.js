@@ -17,6 +17,7 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const express = require('express');
+const WebSocket = require('ws');
 
 // Configuration
 const CONFIG = {
@@ -35,11 +36,87 @@ const CONFIG = {
   exitosApiPort: process.env.EXITOS_API_PORT || 5050,
   heartbeatInterval: 60000,
 
+  // WebSocket for live updates
+  wsUrl: process.env.ADFORGE_WS_URL || 'ws://100.92.203.87:5091',
+
   // Retry settings
   maxRetries: 5,
   initialBackoff: 5000,
   maxBackoff: 300000
 };
+
+// ============================================
+// WEBSOCKET CLIENT FOR LIVE UPDATES
+// ============================================
+
+let wsClient = null;
+let wsReconnectDelay = 1000;
+
+function connectWebSocket() {
+  if (wsClient && wsClient.readyState === WebSocket.OPEN) return;
+
+  log(`Connecting to WebSocket: ${CONFIG.wsUrl}`);
+  wsClient = new WebSocket(CONFIG.wsUrl);
+
+  wsClient.on('open', () => {
+    log('WebSocket connected');
+    wsReconnectDelay = 1000;
+    stats.wsConnected = true;
+  });
+
+  wsClient.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'ping') {
+        wsClient.send(JSON.stringify({ type: 'pong' }));
+      }
+    } catch (e) {}
+  });
+
+  wsClient.on('close', () => {
+    log('WebSocket disconnected, reconnecting...', 'WARN');
+    stats.wsConnected = false;
+    scheduleWsReconnect();
+  });
+
+  wsClient.on('error', (err) => {
+    log(`WebSocket error: ${err.message}`, 'ERROR');
+    stats.wsConnected = false;
+  });
+}
+
+function scheduleWsReconnect() {
+  setTimeout(() => {
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
+    connectWebSocket();
+  }, wsReconnectDelay);
+}
+
+function publishToWebSocket(messages) {
+  if (!wsClient || wsClient.readyState !== WebSocket.OPEN) {
+    log('WebSocket not connected, skipping publish', 'WARN');
+    return false;
+  }
+
+  try {
+    wsClient.send(JSON.stringify({
+      type: 'publish',
+      channel: 'inbox',
+      data: {
+        type: 'new_messages',
+        messages: messages,
+        source: 'imessage-daemon',
+        timestamp: new Date().toISOString()
+      }
+    }));
+    stats.wsPublishes = (stats.wsPublishes || 0) + 1;
+    log(`Published ${messages.length} messages to WebSocket`);
+    return true;
+  } catch (e) {
+    log(`WebSocket publish error: ${e.message}`, 'ERROR');
+    return false;
+  }
+}
 
 // Business keywords for detection
 const BUSINESS_KEYWORDS = [
@@ -67,7 +144,9 @@ const stats = {
   consecutiveFailures: 0,
   dbErrors: 0,
   lastError: null,
-  lastHeartbeat: null
+  lastHeartbeat: null,
+  wsConnected: false,
+  wsPublishes: 0
 };
 
 function log(msg, level = 'INFO') {
@@ -399,10 +478,14 @@ async function runDaemon() {
   log(`  Webhook: ${CONFIG.webhookUrl}`);
   log(`  Health port: ${CONFIG.healthPort}`);
   log(`  Exit OS hub: ${CONFIG.exitosHubIp}:${CONFIG.exitosApiPort}`);
+  log(`  WebSocket: ${CONFIG.wsUrl}`);
   log('═══════════════════════════════════════════════');
 
   // Start health server
   startHealthServer();
+
+  // Connect to WebSocket for live updates
+  connectWebSocket();
 
   // Start heartbeat
   setInterval(sendHeartbeat, CONFIG.heartbeatInterval);
@@ -460,6 +543,9 @@ async function runDaemon() {
             log(`  Business: ${msg.phone} - ${(msg.text || '[attachment]').slice(0, 50)}...`);
           }
         }
+
+        // Publish to WebSocket for live updates
+        publishToWebSocket(messages);
 
         if (await sendWithRetry(messages, state)) {
           state.lastRowid = messages[messages.length - 1].rowid;
