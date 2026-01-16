@@ -536,16 +536,22 @@ async function runDaemon() {
         stats.messagesProcessed += messages.length;
         stats.lastMessageAt = new Date().toISOString();
 
-        for (const msg of messages) {
-          const { isBusiness } = isBusinessMessage(msg.text);
+        // Annotate messages with business detection
+        const annotatedMessages = messages.map(msg => {
+          const { isBusiness, keywords } = isBusinessMessage(msg.text);
           if (isBusiness && !msg.is_from_me) {
             stats.businessMessages++;
             log(`  Business: ${msg.phone} - ${(msg.text || '[attachment]').slice(0, 50)}...`);
           }
-        }
+          return {
+            ...msg,
+            isBusinessRelated: isBusiness && !msg.is_from_me,
+            businessKeywords: keywords
+          };
+        });
 
         // Publish to WebSocket for live updates
-        publishToWebSocket(messages);
+        publishToWebSocket(annotatedMessages);
 
         if (await sendWithRetry(messages, state)) {
           state.lastRowid = messages[messages.length - 1].rowid;
